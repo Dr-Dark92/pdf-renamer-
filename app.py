@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 import sys
 from dataclasses import dataclass
@@ -8,12 +7,26 @@ from pathlib import Path
 from typing import Optional
 
 import fitz
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QRectF, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QListWidget, QMainWindow, QMessageBox, QPushButton, QSpinBox, QSplitter,
-    QTableWidget, QTableWidgetItem, QToolBar, QVBoxLayout, QWidget
+    QApplication,
+    QFileDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSpinBox,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
 )
 
 
@@ -37,6 +50,8 @@ class PdfJob:
 
 
 class PdfCanvas(QWidget):
+    pageClicked = Signal(float, float)
+
     def __init__(self):
         super().__init__()
         self.pixmap = None
@@ -60,26 +75,46 @@ class PdfCanvas(QWidget):
         self.value_rect = None
         self.update()
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(42, 42, 42))
+    def display_geometry(self):
         if not self.pixmap:
-            painter.setPen(Qt.white)
-            painter.drawText(self.rect(), Qt.AlignCenter, "Select a PDF")
-            return
-
+            return None
         margin = 12
+        available_w = max(1, self.width() - margin * 2)
+        available_h = max(1, self.height() - margin * 2)
         scaled = self.pixmap.scaled(
-            max(1, self.width() - margin * 2),
-            max(1, self.height() - margin * 2),
+            available_w,
+            available_h,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
         x = (self.width() - scaled.width()) / 2
         y = (self.height() - scaled.height()) / 2
-        painter.drawPixmap(int(x), int(y), scaled)
         sx = scaled.width() / self.page_w
         sy = scaled.height() / self.page_h
+        return scaled, x, y, sx, sy
+
+    def mousePressEvent(self, event):
+        geometry = self.display_geometry()
+        if geometry and event.button() == Qt.LeftButton:
+            scaled, x, y, sx, sy = geometry
+            px = event.position().x()
+            py = event.position().y()
+            if x <= px <= x + scaled.width() and y <= py <= y + scaled.height():
+                self.pageClicked.emit((px - x) / sx, (py - y) / sy)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(42, 42, 42))
+        geometry = self.display_geometry()
+        if not geometry:
+            painter.setPen(Qt.white)
+            painter.drawText(self.rect(), Qt.AlignCenter, "Select a PDF")
+            return
+        scaled, x, y, sx, sy = geometry
+        painter.drawPixmap(int(x), int(y), scaled)
 
         def draw_box(rect, color, width):
             qrect = QRectF(
@@ -110,6 +145,10 @@ class MainWindow(QMainWindow):
         self.doc = None
         self.current_job = -1
         self.current_page = 0
+        self.manual_row = -1
+        self.manual_stage = None
+        self.manual_tag_rect = None
+        self.manual_tag_page = None
         self.build_ui()
 
     def build_ui(self):
@@ -125,7 +164,6 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.folder_label)
 
         splitter = QSplitter(Qt.Horizontal)
-
         left = QWidget()
         ll = QVBoxLayout(left)
         top = QHBoxLayout()
@@ -138,6 +176,7 @@ class MainWindow(QMainWindow):
         top.addWidget(QLabel("Separator:"))
         self.separator = QLineEdit("_")
         self.separator.setMaximumWidth(80)
+        self.separator.textChanged.connect(self.refresh_current_filename)
         top.addWidget(self.separator)
         ll.addLayout(top)
 
@@ -168,7 +207,6 @@ class MainWindow(QMainWindow):
         bb.addWidget(analyze)
         bb.addWidget(rename)
         ll.addLayout(bb)
-
         self.status = QLabel("Ready.")
         self.status.setWordWrap(True)
         ll.addWidget(self.status)
@@ -179,12 +217,27 @@ class MainWindow(QMainWindow):
         self.selected.setWordWrap(True)
         cl.addWidget(self.selected)
         self.results = QTableWidget(0, 5)
-        self.results.setHorizontalHeaderLabels(
-            ["Order", "Keyword", "Value", "Confidence", "Page"]
-        )
+        self.results.setHorizontalHeaderLabels(["Order", "Keyword", "Value", "Confidence", "Page"])
         self.results.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.results.itemSelectionChanged.connect(self.result_selected)
         cl.addWidget(self.results)
+
+        manual_buttons = QHBoxLayout()
+        self.manual_pick_btn = QPushButton("Manual Pick Tag → Value")
+        self.manual_pick_btn.clicked.connect(self.start_manual_pick)
+        manual_buttons.addWidget(self.manual_pick_btn)
+        clear_manual_btn = QPushButton("Clear Selected Result")
+        clear_manual_btn.clicked.connect(self.clear_selected_result)
+        manual_buttons.addWidget(clear_manual_btn)
+        cl.addLayout(manual_buttons)
+
+        self.manual_help = QLabel(
+            "Manual mode: select a result row, click 'Manual Pick Tag → Value', "
+            "then click the tag and the value in the PDF."
+        )
+        self.manual_help.setWordWrap(True)
+        cl.addWidget(self.manual_help)
+
         cl.addWidget(QLabel("Proposed filename:"))
         self.filename = QLineEdit()
         cl.addWidget(self.filename)
@@ -202,11 +255,9 @@ class MainWindow(QMainWindow):
         nav.addWidget(self.page_label, 1)
         nav.addWidget(next_btn)
         rl.addLayout(nav)
-        rl.addWidget(
-            QLabel('<span style="color:#ffc107;">■ Keyword</span> &nbsp; '
-                   '<span style="color:#4caf50;">■ Value</span>')
-        )
+        rl.addWidget(QLabel('<span style="color:#ffc107;">■ Keyword</span> &nbsp; <span style="color:#4caf50;">■ Value</span>'))
         self.canvas = PdfCanvas()
+        self.canvas.pageClicked.connect(self.pdf_clicked)
         rl.addWidget(self.canvas, 1)
 
         splitter.addWidget(left)
@@ -217,10 +268,7 @@ class MainWindow(QMainWindow):
         self.rebuild_rules()
 
     def rebuild_rules(self):
-        old = [
-            self.rules.item(i, 1).text() if self.rules.item(i, 1) else ""
-            for i in range(self.rules.rowCount())
-        ]
+        old = [self.rules.item(i, 1).text() if self.rules.item(i, 1) else "" for i in range(self.rules.rowCount())]
         self.rules.setRowCount(self.count.value())
         for i in range(self.count.value()):
             order = QTableWidgetItem(str(i + 1))
@@ -240,10 +288,7 @@ class MainWindow(QMainWindow):
         self.rules.selectRow(target)
 
     def keywords(self):
-        return [
-            self.rules.item(i, 1).text().strip() if self.rules.item(i, 1) else ""
-            for i in range(self.rules.rowCount())
-        ]
+        return [self.rules.item(i, 1).text().strip() if self.rules.item(i, 1) else "" for i in range(self.rules.rowCount())]
 
     def open_folder(self):
         path = QFileDialog.getExistingDirectory(self, "Select PDF folder")
@@ -255,10 +300,8 @@ class MainWindow(QMainWindow):
     def rescan(self):
         if not self.folder:
             return
-        pdfs = sorted(
-            [p for p in self.folder.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"],
-            key=lambda p: p.name.casefold(),
-        )
+        self.cancel_manual_pick()
+        pdfs = sorted([p for p in self.folder.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"], key=lambda p: p.name.casefold())
         self.jobs = [PdfJob(p) for p in pdfs]
         self.refresh_list()
         self.status.setText(f"Found {len(self.jobs)} PDF(s).")
@@ -267,13 +310,14 @@ class MainWindow(QMainWindow):
 
     def refresh_list(self):
         selected = self.file_list.currentRow()
+        self.file_list.blockSignals(True)
         self.file_list.clear()
         for job in self.jobs:
             text = f"[{job.status}] {job.path.name}"
             if job.proposed_name:
                 text += f" → {job.proposed_name}"
-            item = QTableWidgetItem(text) if False else None
             self.file_list.addItem(text)
+        self.file_list.blockSignals(False)
         if self.jobs and selected >= 0:
             self.file_list.setCurrentRow(min(selected, len(self.jobs) - 1))
 
@@ -283,12 +327,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def union(words):
-        return fitz.Rect(
-            min(w[0] for w in words),
-            min(w[1] for w in words),
-            max(w[2] for w in words),
-            max(w[3] for w in words),
-        )
+        return fitz.Rect(min(w[0] for w in words), min(w[1] for w in words), max(w[2] for w in words), max(w[3] for w in words))
 
     @staticmethod
     def find_span(words, target):
@@ -312,100 +351,68 @@ class MainWindow(QMainWindow):
             words.pop(0)
         if not words:
             return []
-
         chosen = []
         previous_x1 = None
         for word in words:
             text = word[4].strip()
             normalized = re.sub(r"[:：]+$", "", self.norm(text))
-
             if normalized in label_norms:
                 if chosen:
                     break
                 return []
-
             if text.endswith((":", "：")):
                 if chosen:
                     break
                 return []
-
             if previous_x1 is not None and word[0] - previous_x1 > 32:
                 break
-
             chosen.append(word)
             previous_x1 = word[2]
             if len(chosen) >= 12:
                 break
-
         return chosen
 
     def find_value(self, doc, keyword, configured_keywords=None):
         target = self.norm(keyword).split()
         if not target:
             return None
-
-        labels = {
-            re.sub(r"[:：]+$", "", self.norm(k))
-            for k in (configured_keywords or [])
-            if k.strip()
-        }
-
+        labels = {re.sub(r"[:：]+$", "", self.norm(k)) for k in (configured_keywords or []) if k.strip()}
         for page_index in range(doc.page_count):
             page = doc[page_index]
             words = page.get_text("words", sort=True)
             if not words:
                 continue
-
             lines = {}
             for word in words:
                 lines.setdefault((int(word[5]), int(word[6])), []).append(word)
-
             for line_words in lines.values():
                 line_words.sort(key=lambda w: w[7])
                 normalized_words = [self.norm(w[4]) for w in line_words]
                 span = self.find_span(normalized_words, target)
                 if span is None:
                     continue
-
                 start, end = span
                 keyword_words = line_words[start:end]
                 keyword_rect = self.union(keyword_words)
                 kw_center_y = (keyword_rect.y0 + keyword_rect.y1) / 2
                 kw_height = max(keyword_rect.height, 1.0)
-
-                # Primary strategy: visual geometry. Search every word on the page
-                # that is horizontally aligned to the right of the keyword.
                 right_candidates = []
                 for word in words:
                     rect = fitz.Rect(word[0], word[1], word[2], word[3])
-
                     if rect.intersects(keyword_rect) and rect.get_area() > 0:
                         continue
                     if rect.x0 < keyword_rect.x1 - 1:
                         continue
                     if rect.x0 - keyword_rect.x1 > 320:
                         continue
-
                     center_y = (rect.y0 + rect.y1) / 2
                     if abs(center_y - kw_center_y) > max(5.0, kw_height * 0.75):
                         continue
-
                     right_candidates.append(word)
-
                 right_candidates.sort(key=lambda w: w[0])
                 value_words = self.take_value_words(right_candidates, labels)
-
                 if value_words:
-                    return MatchResult(
-                        keyword,
-                        " ".join(w[4] for w in value_words).strip(),
-                        page_index,
-                        keyword_rect,
-                        self.union(value_words),
-                        "HIGH",
-                    )
-
-                # Fallback: nearest plausible line below the keyword.
+                    return MatchResult(keyword, " ".join(w[4] for w in value_words).strip(), page_index, keyword_rect, self.union(value_words), "HIGH")
                 candidates = []
                 for other in lines.values():
                     if not other:
@@ -415,33 +422,201 @@ class MainWindow(QMainWindow):
                     vertical_gap = rect.y0 - keyword_rect.y1
                     if vertical_gap < 0 or vertical_gap > 120:
                         continue
-
-                    horizontal_distance = min(
-                        abs(rect.x0 - keyword_rect.x0),
-                        abs(rect.x0 - keyword_rect.x1),
-                    )
+                    horizontal_distance = min(abs(rect.x0 - keyword_rect.x0), abs(rect.x0 - keyword_rect.x1))
                     if horizontal_distance > 180:
                         continue
-
                     value_words = self.take_value_words(other, labels)
                     if not value_words:
                         continue
-
                     score = vertical_gap + min(horizontal_distance * 0.25, 60)
                     candidates.append((score, value_words))
-
                 if candidates:
                     _, value_words = min(candidates, key=lambda item: item[0])
-                    return MatchResult(
-                        keyword,
-                        " ".join(w[4] for w in value_words).strip(),
-                        page_index,
-                        keyword_rect,
-                        self.union(value_words),
-                        "MEDIUM",
-                    )
-
+                    return MatchResult(keyword, " ".join(w[4] for w in value_words).strip(), page_index, keyword_rect, self.union(value_words), "MEDIUM")
         return None
+
+    def start_manual_pick(self):
+        if not self.doc or self.current_job < 0:
+            return QMessageBox.information(self, "No PDF selected", "Select a PDF before using manual mapping.")
+        row = self.results.currentRow()
+        if row < 0:
+            return QMessageBox.information(self, "Select a field", "Select the keyword/value row you want to correct first.")
+        self.manual_row = row
+        self.manual_stage = "tag"
+        self.manual_tag_rect = None
+        self.manual_tag_page = None
+        keyword = self.keywords()[row]
+        self.status.setText(f"Manual mapping for '{keyword}': click the TAG in the PDF.")
+        self.manual_pick_btn.setText("Picking tag…")
+
+    def cancel_manual_pick(self):
+        self.manual_row = -1
+        self.manual_stage = None
+        self.manual_tag_rect = None
+        self.manual_tag_page = None
+        if hasattr(self, "manual_pick_btn"):
+            self.manual_pick_btn.setText("Manual Pick Tag → Value")
+
+    def pdf_clicked(self, page_x, page_y):
+        if self.manual_stage not in {"tag", "value"}:
+            return
+        if not self.doc or self.current_job < 0:
+            self.cancel_manual_pick()
+            return
+        page = self.doc[self.current_page]
+        if self.manual_stage == "tag":
+            rect = self.manual_tag_rect_from_click(page, page_x, page_y, self.keywords()[self.manual_row])
+            if rect is None:
+                self.status.setText("No text found at that point. Click directly on the tag text.")
+                return
+            self.manual_tag_rect = rect
+            self.manual_tag_page = self.current_page
+            self.manual_stage = "value"
+            self.render_page(keyword_rect=rect)
+            self.status.setText("Tag selected. Now click the VALUE in the PDF (for multi-word values, click the first word).")
+            self.manual_pick_btn.setText("Picking value…")
+            return
+
+        value_words = self.manual_value_words_from_click(page, page_x, page_y)
+        if not value_words:
+            self.status.setText("No value text found at that point. Click directly on the value.")
+            return
+        value = " ".join(word[4] for word in value_words).strip()
+        value_rect = self.union(value_words)
+        keyword = self.keywords()[self.manual_row]
+        if self.manual_tag_page != self.current_page:
+            self.status.setText("Tag and value must be selected on the same page. Start manual mapping again.")
+            self.cancel_manual_pick()
+            return
+
+        job = self.jobs[self.current_job]
+        if job.results is None or len(job.results) != len(self.keywords()):
+            job.results = [None] * len(self.keywords())
+        result = MatchResult(keyword, value, self.current_page, self.manual_tag_rect, value_rect, "MANUAL")
+        job.results[self.manual_row] = result
+        job.proposed_name = self.proposed(job.results)
+        self.recalculate_job_status(job)
+        selected_row = self.manual_row
+        self.cancel_manual_pick()
+        self.refresh_list()
+        self.populate_current_job()
+        self.results.selectRow(selected_row)
+        self.show_result(result)
+        self.status.setText(f"Manual mapping saved: {keyword} → {value}")
+
+    def word_at_point(self, page, x, y, tolerance=3.0):
+        words = page.get_text("words", sort=True)
+        if not words:
+            return None
+        point = fitz.Point(x, y)
+        direct = []
+        for word in words:
+            rect = fitz.Rect(word[0], word[1], word[2], word[3])
+            expanded = fitz.Rect(rect.x0 - tolerance, rect.y0 - tolerance, rect.x1 + tolerance, rect.y1 + tolerance)
+            if point in expanded:
+                direct.append((rect.get_area(), word))
+        if direct:
+            return min(direct, key=lambda item: item[0])[1]
+        nearby = []
+        for word in words:
+            rect = fitz.Rect(word[0], word[1], word[2], word[3])
+            cx = min(max(x, rect.x0), rect.x1)
+            cy = min(max(y, rect.y0), rect.y1)
+            distance_sq = (x - cx) ** 2 + (y - cy) ** 2
+            if distance_sq <= 100:
+                nearby.append((distance_sq, word))
+        return min(nearby, key=lambda item: item[0])[1] if nearby else None
+
+    def manual_tag_rect_from_click(self, page, x, y, keyword):
+        clicked = self.word_at_point(page, x, y)
+        if clicked is None:
+            return None
+        words = page.get_text("words", sort=True)
+        target = self.norm(keyword).split()
+        lines = {}
+        for word in words:
+            lines.setdefault((int(word[5]), int(word[6])), []).append(word)
+        point = fitz.Point(x, y)
+        for line_words in lines.values():
+            line_words.sort(key=lambda w: w[7])
+            normalized_words = [self.norm(w[4]) for w in line_words]
+            span = self.find_span(normalized_words, target)
+            if span is None:
+                continue
+            start, end = span
+            tag_words = line_words[start:end]
+            rect = self.union(tag_words)
+            expanded = fitz.Rect(rect.x0 - 4, rect.y0 - 4, rect.x1 + 4, rect.y1 + 4)
+            if point in expanded:
+                return rect
+        return fitz.Rect(clicked[0], clicked[1], clicked[2], clicked[3])
+
+    def manual_value_words_from_click(self, page, x, y):
+        clicked = self.word_at_point(page, x, y)
+        if clicked is None:
+            return []
+        words = page.get_text("words", sort=True)
+        block_no = int(clicked[5])
+        line_no = int(clicked[6])
+        word_no = int(clicked[7])
+        line_words = [word for word in words if int(word[5]) == block_no and int(word[6]) == line_no]
+        line_words.sort(key=lambda word: word[7])
+        start_index = None
+        for index, word in enumerate(line_words):
+            if int(word[7]) == word_no:
+                start_index = index
+                break
+        if start_index is None:
+            return [clicked]
+        chosen = []
+        previous_x1 = None
+        for word in line_words[start_index:]:
+            text = word[4].strip()
+            if previous_x1 is not None and word[0] - previous_x1 > 32:
+                break
+            if chosen and text.endswith((":", "：")):
+                break
+            chosen.append(word)
+            previous_x1 = word[2]
+            if len(chosen) >= 12:
+                break
+        return chosen
+
+    def clear_selected_result(self):
+        if self.current_job < 0:
+            return
+        row = self.results.currentRow()
+        if row < 0:
+            return
+        job = self.jobs[self.current_job]
+        if job.results is None:
+            return
+        if row < len(job.results):
+            job.results[row] = None
+            job.proposed_name = self.proposed(job.results)
+            self.recalculate_job_status(job)
+            self.refresh_list()
+            self.populate_current_job()
+            self.results.selectRow(row)
+            self.status.setText("Selected extraction result cleared.")
+
+    def recalculate_job_status(self, job):
+        if not job.results or any(result is None for result in job.results):
+            job.status = "REVIEW"
+            job.error = "One or more values were not found"
+            return
+        job.proposed_name = self.proposed(job.results)
+        if not job.proposed_name:
+            job.status = "REVIEW"
+            job.error = "Generated filename is empty"
+            return
+        destination = job.path.with_name(job.proposed_name)
+        if destination.exists() and destination != job.path:
+            job.status = "CONFLICT"
+            job.error = "Destination already exists"
+        else:
+            job.status = "PASS"
+            job.error = ""
 
     @staticmethod
     def safe(text):
@@ -456,48 +631,46 @@ class MainWindow(QMainWindow):
             return ""
         return self.separator.text().join(parts) + ".pdf"
 
+    def refresh_current_filename(self):
+        if self.current_job < 0 or self.current_job >= len(self.jobs):
+            return
+        job = self.jobs[self.current_job]
+        if job.results:
+            job.proposed_name = self.proposed(job.results)
+            self.recalculate_job_status(job)
+            self.filename.setText(job.proposed_name)
+            self.refresh_list()
+
     def analyze_all(self):
         keys = self.keywords()
         if not self.jobs:
             return QMessageBox.information(self, "No PDFs", "Select a folder first.")
         if any(not key for key in keys):
             return QMessageBox.warning(self, "Missing keyword", "Fill every keyword row.")
-
+        self.cancel_manual_pick()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             for index, job in enumerate(self.jobs):
-                self.status.setText(
-                    f"Analyzing {index + 1}/{len(self.jobs)}: {job.path.name}"
-                )
+                self.status.setText(f"Analyzing {index + 1}/{len(self.jobs)}: {job.path.name}")
                 QApplication.processEvents()
                 try:
                     with fitz.open(str(job.path)) as doc:
                         if sum(len(page.get_text("words")) for page in doc) == 0:
                             job.status = "OCR NEEDED"
                             job.error = "No embedded text"
+                            job.results = None
+                            job.proposed_name = ""
                             continue
-
                         job.results = [self.find_value(doc, key, keys) for key in keys]
                         job.proposed_name = self.proposed(job.results)
-
-                        if any(result is None for result in job.results):
-                            job.status = "REVIEW"
-                            job.error = "One or more values were not found"
-                        elif (
-                            job.path.with_name(job.proposed_name).exists()
-                            and job.path.with_name(job.proposed_name) != job.path
-                        ):
-                            job.status = "CONFLICT"
-                            job.error = "Destination already exists"
-                        else:
-                            job.status = "PASS"
-                            job.error = ""
+                        self.recalculate_job_status(job)
                 except Exception as exc:
                     job.status = "ERROR"
                     job.error = str(exc)
+                    job.results = None
+                    job.proposed_name = ""
         finally:
             QApplication.restoreOverrideCursor()
-
         self.refresh_list()
         self.status.setText("Analysis complete.")
         if self.current_job >= 0:
@@ -506,37 +679,34 @@ class MainWindow(QMainWindow):
     def select_job(self, row):
         if row < 0 or row >= len(self.jobs):
             return
+        self.cancel_manual_pick()
         self.current_job = row
-        job = self.jobs[row]
-        self.selected.setText(
-            f"{job.path.name}\nStatus: {job.status}"
-            + (f"\n{job.error}" if job.error else "")
-        )
+        self.open_doc(self.jobs[row].path)
+        self.populate_current_job()
+
+    def populate_current_job(self):
+        if self.current_job < 0 or self.current_job >= len(self.jobs):
+            return
+        job = self.jobs[self.current_job]
+        self.selected.setText(f"{job.path.name}\nStatus: {job.status}" + (f"\n{job.error}" if job.error else ""))
         self.filename.setText(job.proposed_name)
         keys = self.keywords()
         self.results.setRowCount(len(keys))
-
         for i, key in enumerate(keys):
             result = job.results[i] if job.results and i < len(job.results) else None
-            values = [
-                str(i + 1),
-                key,
-                result.value if result else "NOT FOUND",
-                result.confidence if result else "-",
-                str(result.page_index + 1) if result else "-",
-            ]
+            values = [str(i + 1), key, result.value if result else "NOT FOUND", result.confidence if result else "-", str(result.page_index + 1) if result else "-"]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 self.results.setItem(i, column, item)
-
-        self.open_doc(job.path)
         if job.results:
             for i, result in enumerate(job.results):
                 if result:
                     self.results.selectRow(i)
                     self.show_result(result)
                     break
+        else:
+            self.render_page()
 
     def open_doc(self, path):
         if self.doc:
@@ -550,23 +720,9 @@ class MainWindow(QMainWindow):
             return
         page = self.doc[self.current_page]
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-        image = QImage(
-            pix.samples,
-            pix.width,
-            pix.height,
-            pix.stride,
-            QImage.Format_RGB888,
-        ).copy()
-        self.canvas.set_page(
-            QPixmap.fromImage(image),
-            page.rect.width,
-            page.rect.height,
-            keyword_rect,
-            value_rect,
-        )
-        self.page_label.setText(
-            f"Page {self.current_page + 1} / {self.doc.page_count}"
-        )
+        image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
+        self.canvas.set_page(QPixmap.fromImage(image), page.rect.width, page.rect.height, keyword_rect, value_rect)
+        self.page_label.setText(f"Page {self.current_page + 1} / {self.doc.page_count}")
 
     def result_selected(self):
         if self.current_job < 0:
@@ -593,24 +749,14 @@ class MainWindow(QMainWindow):
     def rename_passed(self):
         passed = [job for job in self.jobs if job.status == "PASS"]
         if not passed:
-            return QMessageBox.information(
-                self, "Nothing to rename", "No PASS files."
-            )
-
-        answer = QMessageBox.question(
-            self,
-            "Confirm",
-            f"Rename {len(passed)} PDF(s)?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
+            return QMessageBox.information(self, "Nothing to rename", "No PASS files.")
+        answer = QMessageBox.question(self, "Confirm", f"Rename {len(passed)} PDF(s)?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer != QMessageBox.Yes:
             return
-
+        self.cancel_manual_pick()
         if self.doc:
             self.doc.close()
             self.doc = None
-
         renamed = 0
         for job in passed:
             try:
@@ -626,7 +772,6 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 job.status = "ERROR"
                 job.error = str(exc)
-
         self.refresh_list()
         self.status.setText(f"Renamed {renamed} PDF(s).")
 
