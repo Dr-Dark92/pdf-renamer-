@@ -19,18 +19,31 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build EXE
+      - name: Install Tesseract OCR
+        shell: powershell
         run: |
-          pyinstaller --noconfirm --clean --windowed --onefile --name PDFRenamer app.py
+          choco install tesseract -y --no-progress
+          if (-not (Test-Path "C:\Program Files\Tesseract-OCR\tesseract.exe")) {
+            throw "Tesseract installation not found"
+          }
 
-      - name: Upload EXE
+      - name: Build Windows app
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onedir --name PDFRenamer app.py
+
+      - name: Bundle Tesseract runtime
+        shell: powershell
+        run: |
+          Copy-Item -Recurse -Force "C:\Program Files\Tesseract-OCR" "dist\PDFRenamer\tesseract"
+
+      - name: Upload Windows bundle
         uses: actions/upload-artifact@v4
         with:
-          name: PDFRenamer-Windows
-          path: dist/PDFRenamer.exe
+          name: PDFRenamer-Windows-OCR
+          path: dist/PDFRenamer/
